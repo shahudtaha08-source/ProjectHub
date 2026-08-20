@@ -82,7 +82,6 @@ def rename_score(project_name, folder_name):
     a, b = project_tokens(project_name), project_tokens(folder_name)
     if not a or not b:
         return 0.0
-    # Strongly prefer the same starting token; EmoBody -> EmoBody Games is a valid rename candidate.
     first = difflib.SequenceMatcher(None, a[0], b[0]).ratio()
     full = difflib.SequenceMatcher(None, "".join(a), "".join(b)).ratio()
     return max(first * 0.8 + full * 0.2, full)
@@ -113,7 +112,6 @@ def find_renamed_folder(name, old_path):
     if not candidates:
         return None, 0.0
     best_score, best = candidates[0]
-    # Avoid ambiguous automatic relinking.
     if len(candidates) > 1 and best_score - candidates[1][0] < 0.08:
         return None, 0.0
     return str(best), best_score
@@ -180,7 +178,8 @@ def open_project(name, projects):
         elif platform.system() == "Darwin": subprocess.run(["open", path], check=True)
         else: subprocess.run(["xdg-open", path], check=True)
         print(f"[OK] Opened '{name}'")
-    except Exception as exc: print(f"[ERROR] Could not open folder: {exc}")
+    except Exception as exc:
+        print(f"[ERROR] Could not open folder: {exc}")
 
 
 def scan_signature(path):
@@ -189,8 +188,10 @@ def scan_signature(path):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
         for filename in files:
             full = os.path.join(root, filename)
-            try: stat = os.stat(full)
-            except OSError: continue
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
             rel = os.path.relpath(full, path).replace("\\", "/")
             entries.append(f"{rel}|{stat.st_size}|{stat.st_mtime_ns}")
     entries.sort()
@@ -198,8 +199,10 @@ def scan_signature(path):
 
 
 def load_cache():
-    try: return json.loads(CACHE_FILE.read_text(encoding="utf-8")) if CACHE_FILE.exists() else {}
-    except (OSError, json.JSONDecodeError): return {}
+    try:
+        return json.loads(CACHE_FILE.read_text(encoding="utf-8")) if CACHE_FILE.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def save_cache(cache):
@@ -212,86 +215,146 @@ def save_cache(cache):
 def git(path, *args):
     return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True)
 
+
 def is_git_repo(path):
     return shutil.which("git") is not None and git(path, "rev-parse", "--is-inside-work-tree").returncode == 0
 
+
 def ensure_git_repo(path, branch):
-    if is_git_repo(path): return True, "existing git repository"
-    if shutil.which("git") is None: return False, "git is not installed or not on PATH"
+    if is_git_repo(path):
+        return True, False, "existing git repository"
+    if shutil.which("git") is None:
+        return False, False, "git is not installed or not on PATH"
     result = git(path, "init")
-    if result.returncode: return False, result.stderr.strip() or "git init failed"
+    if result.returncode:
+        return False, False, result.stderr.strip() or "git init failed"
     result = git(path, "branch", "-M", branch or "main")
-    return (True, "initialized git repository") if not result.returncode else (False, result.stderr.strip() or "could not set initial branch")
+    if result.returncode:
+        return False, False, result.stderr.strip() or "could not set initial branch"
+    return True, True, "initialized git repository"
+
 
 def get_remote(path):
     result = git(path, "remote", "get-url", "origin")
     return result.stdout.strip() if result.returncode == 0 else ""
 
+
 def repo_slug(name):
     slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name)
     return "-".join(x for x in slug.split("-") if x) or "project"
 
+
 def github_api_create_repo(name):
-    if not GITHUB_TOKEN: return False, "GITHUB_TOKEN is missing"
+    if not GITHUB_TOKEN:
+        return False, "GITHUB_TOKEN is missing"
     payload = json.dumps({"name": name, "private": GITHUB_VISIBILITY != "public", "auto_init": False}).encode()
-    request = urllib.request.Request("https://api.github.com/user/repos", data=payload, method="POST", headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": "ProjectHub"})
+    request = urllib.request.Request(
+        "https://api.github.com/user/repos",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "ProjectHub",
+        },
+    )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response: data = json.loads(response.read().decode())
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode())
         return True, data["clone_url"]
     except urllib.error.HTTPError as exc:
-        if exc.code == 422: return True, f"https://github.com/{GITHUB_OWNER}/{name}.git"
+        if exc.code == 422:
+            return True, f"https://github.com/{GITHUB_OWNER}/{name}.git"
         return False, f"GitHub API HTTP {exc.code}: {exc.reason}"
-    except Exception as exc: return False, f"GitHub repo creation failed: {exc}"
+    except Exception as exc:
+        return False, f"GitHub repo creation failed: {exc}"
+
 
 def ensure_remote(name, path):
     remote = get_remote(path)
-    if remote: return True, remote
-    if not AUTO_CREATE_REPOS: return False, "no remote configured (AUTO_CREATE_REPOS=false)"
+    if remote:
+        return True, remote
+    if not AUTO_CREATE_REPOS:
+        return False, "no remote configured (AUTO_CREATE_REPOS=false)"
     ok, detail = github_api_create_repo(repo_slug(name))
-    if not ok: return False, detail
+    if not ok:
+        return False, detail
     result = git(path, "remote", "add", "origin", detail)
-    return (True, f"created/linked {detail}") if not result.returncode else (False, result.stderr.strip() or "could not add GitHub remote")
+    if result.returncode:
+        return False, result.stderr.strip() or "could not add GitHub remote"
+    return True, f"created/linked {detail}"
+
+
+def ensure_initial_commit(path, project_name, created_repo):
+    status = git(path, "status", "--porcelain")
+    if status.returncode:
+        return False, status.stderr.strip() or "git status failed"
+    if not status.stdout.strip():
+        return True, "working tree already clean"
+    message = f"chore: initialize {project_name}" if created_repo else f"chore: initialize repository for {project_name}"
+    commit = git(path, "commit", "-m", message)
+    if commit.returncode:
+        return False, commit.stderr.strip() or commit.stdout.strip() or "git commit failed"
+    return True, message
+
 
 def auto_project(name, info, cache):
     path = info.get("path", "")
-    if not os.path.isdir(path): return "skipped", "path missing"
+    if not os.path.isdir(path):
+        return "skipped", "path missing"
     current, previous = scan_signature(path), cache.get(name)
     if previous is None:
         cache[name] = current
         return "baseline", "baseline created"
-    if current.get("hash") == previous.get("hash"): return "skipped", "no detected changes"
+    if current.get("hash") == previous.get("hash"):
+        return "skipped", "no detected changes"
+
     branch = str(info.get("branch") or "main")
-    ok, detail = ensure_git_repo(path, branch)
-    if not ok: return "error", detail
-    ok, detail = ensure_remote(name, path)
-    if not ok: return "skipped", detail
-    if git(path, "add", ".").returncode: return "error", "git add failed"
-    status = git(path, "status", "--porcelain")
-    if status.returncode: return "error", status.stderr.strip() or "git status failed"
-    if not status.stdout.strip():
-        cache[name] = current
-        return "skipped", "filesystem changed only in ignored files"
-    commit = git(path, "commit", "-m", f"chore: automated project update for {name}")
-    if commit.returncode: return "error", commit.stderr.strip() or commit.stdout.strip()
+    ok, initialized, detail = ensure_git_repo(path, branch)
+    if not ok:
+        return "error", detail
+
+    ok, remote_detail = ensure_remote(name, path)
+    if not ok:
+        return "skipped", remote_detail
+
+    add = git(path, "add", ".")
+    if add.returncode:
+        return "error", add.stderr.strip() or "git add failed"
+
+    ok, commit_detail = ensure_initial_commit(path, name, initialized)
+    if not ok:
+        return "error", commit_detail
+
     active = git(path, "branch", "--show-current").stdout.strip() or branch
     push = git(path, "push", "-u", "origin", active)
-    if push.returncode: return "error", push.stderr.strip() or "git push failed"
+    if push.returncode:
+        return "error", push.stderr.strip() or "git push failed"
+
     cache[name] = current
-    return "updated", detail
+    return "updated", f"{detail}; {remote_detail}; {commit_detail}; pushed {active}"
+
 
 def run_auto(projects, only_names=None):
     resolve_missing_paths(projects)
-    cache, summary = load_cache(), {"updated":0,"skipped":0,"errors":0,"baselined":0}
+    cache, summary = load_cache(), {"updated": 0, "skipped": 0, "errors": 0, "baselined": 0}
     allowed = set(only_names) if only_names else None
     for name, info in projects.items():
-        if allowed is not None and name not in allowed: continue
+        if allowed is not None and name not in allowed:
+            continue
         status, detail = auto_project(name, info, cache)
-        label = status.upper()
-        print(f"[{label}] {name}" + (f" ({detail})" if status != "error" else f": {detail}"))
-        summary[{"updated":"updated","baseline":"baselined","error":"errors"}.get(status,"skipped")] += 1
+        label = {"updated": "UPDATED", "baseline": "BASELINE", "error": "ERROR", "skipped": "SKIPPED"}[status]
+        if status == "error":
+            print(f"[{label}] {name}: {detail}")
+        else:
+            print(f"[{label}] {name} ({detail})")
+        summary[{"updated": "updated", "baseline": "baselined", "error": "errors"}.get(status, "skipped")] += 1
     save_cache(cache)
     print("\n===== Auto Mode Summary =====")
-    for k in ("updated","baselined","skipped","errors"): print(f"[{k.upper():<9}] {summary[k]}")
+    for k in ("updated", "baselined", "skipped", "errors"):
+        print(f"[{k.upper():<9}] {summary[k]}")
+
 
 def watch_projects(projects):
     resolve_missing_paths(projects)
@@ -299,35 +362,54 @@ def watch_projects(projects):
     print("[WATCH] Baseline scan started. Press Ctrl+C to stop.")
     observed, pending = {}, {}
     for name, info in projects.items():
-        path = info.get("path", ""); observed[name] = scan_signature(path) if os.path.isdir(path) else None
+        path = info.get("path", "")
+        observed[name] = scan_signature(path) if os.path.isdir(path) else None
     try:
         while True:
             now = time.monotonic()
             resolve_missing_paths(projects)
             for name, info in projects.items():
-                path = info.get("path", ""); current = scan_signature(path) if os.path.isdir(path) else None
+                path = info.get("path", "")
+                current = scan_signature(path) if os.path.isdir(path) else None
                 if current != observed.get(name):
-                    observed[name] = current; pending[name] = now; print(f"[DETECTED] {name}")
-            for name in [n for n,t in pending.items() if now-t >= WATCH_DEBOUNCE]:
-                pending.pop(name, None); print(f"[PROCESSING] {name} (changes stable)")
-                run_auto(projects, [name]); path = projects[name].get("path", "")
+                    observed[name] = current
+                    pending[name] = now
+                    print(f"[DETECTED] {name}")
+            for name in [n for n, t in pending.items() if now - t >= WATCH_DEBOUNCE]:
+                pending.pop(name, None)
+                print(f"[PROCESSING] {name} (changes stable)")
+                run_auto(projects, [name])
+                path = projects[name].get("path", "")
                 observed[name] = scan_signature(path) if os.path.isdir(path) else None
             time.sleep(WATCH_INTERVAL)
-    except KeyboardInterrupt: print("\n[WATCH] Stopped.")
+    except KeyboardInterrupt:
+        print("\n[WATCH] Stopped.")
+
 
 def menu(projects):
     while True:
         print("\n===== Project Hub =====\n1. List Projects\n2. Open Project\n3. Run Auto Mode\n4. Watch Projects\n5. Exit")
-        try: choice = input("Choose an option (1-5): ").strip()
-        except (EOFError, KeyboardInterrupt): print("\nGoodbye."); return
-        if choice == "1": display_projects(projects)
+        try:
+            choice = input("Choose an option (1-5): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            return
+        if choice == "1":
+            display_projects(projects)
         elif choice == "2":
             name = find_project(input("Project name: ").strip(), projects)
-            if name: open_project(name, projects)
-        elif choice == "3": run_auto(projects)
-        elif choice == "4": watch_projects(projects)
-        elif choice == "5": print("Goodbye."); return
-        else: print("[INVALID] Please choose 1-5.")
+            if name:
+                open_project(name, projects)
+        elif choice == "3":
+            run_auto(projects)
+        elif choice == "4":
+            watch_projects(projects)
+        elif choice == "5":
+            print("Goodbye.")
+            return
+        else:
+            print("[INVALID] Please choose 1-5.")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -336,20 +418,31 @@ def main():
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--open", nargs="?")
     args = parser.parse_args()
-    print(f"Loading index from: {INDEX_FILE}")
+
+    print(f"Loading index from: {INDEX_FILE}\n")
     projects = load_index()
-    if not projects: return
-    print("\nValidating project paths...")
+    if not projects:
+        return
+    print("Validating project paths...")
     validate_paths(projects)
-    if args.validate: return
-    if args.auto: run_auto(projects); return
-    if args.watch: watch_projects(projects); return
-    if args.open:
-        name = find_project(args.open, projects)
-        if name: open_project(name, projects)
+
+    if args.validate:
+        display_projects(projects)
+        return
+    if args.open is not None:
+        name = find_project(args.open or input("Project name: ").strip(), projects)
+        if name:
+            open_project(name, projects)
+        return
+    if args.auto:
+        run_auto(projects)
+        return
+    if args.watch:
+        watch_projects(projects)
         return
     display_projects(projects)
     menu(projects)
+
 
 if __name__ == "__main__":
     main()
