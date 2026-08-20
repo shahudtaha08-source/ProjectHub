@@ -31,6 +31,7 @@ def load_env(path):
             pass
     return values
 
+
 ENV = load_env(SCRIPT_DIR / ".env")
 HUB_DIR = Path(ENV.get("PROJECT_HUB") or SCRIPT_DIR).expanduser().resolve()
 INDEX_FILE = HUB_DIR / "projects_index.json"
@@ -253,12 +254,14 @@ def repo_slug(name, info):
 
 def github_api_request(method, url, token, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {token}",
+    headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "ProjectHub",
         "Content-Type": "application/json",
-    })
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as response:
             return response.status, json.loads(response.read().decode() or "{}")
@@ -308,6 +311,14 @@ def expected_remote(owner, repo):
     return f"https://github.com/{owner}/{repo}.git"
 
 
+def github_repo_exists_from_remote(url, token):
+    match = re.search(r"github\.com[/:]([^/]+)/([^/#]+)", url or "", re.IGNORECASE)
+    if not match:
+        return False, "non-GitHub remote"
+    owner, repo = match.group(1), match.group(2).removesuffix(".git")
+    return github_repo_exists(owner, repo, token)
+
+
 def remote_status(owner, repo, path, token):
     current = get_remote(path)
     if not current:
@@ -325,65 +336,56 @@ def remote_status(owner, repo, path, token):
     return "mismatch", current
 
 
-def github_repo_exists_from_remote(url, token):
-    match = re.search(r"github\.com[/:]([^/]+)/([^/#]+)", url or "", re.IGNORECASE)
-    if not match:
-        return False, "non-GitHub remote"
-    owner, repo = match.group(1), match.group(2).removesuffix(".git")
-    return github_repo_exists(owner, repo, token)
-
-
-def ensure_remote_for_project(name, info, path, apply):
+def ensure_remote_for_project(name, info, path, apply=True):
     owner = GITHUB_OWNER
     repo = repo_slug(name, info)
     target = expected_remote(owner, repo)
     current = get_remote(path)
+
     if current:
         status, detail = remote_status(owner, repo, path, GITHUB_TOKEN)
         if status in {"valid", "valid-mapped"}:
             return True, f"preserved existing remote {detail}"
         if status == "broken":
             print(f"[BROKEN] {name}: remote does not exist on GitHub: {current}")
-            if not apply:
-                return False, "broken remote requires repair"
-            if not GITHUB_TOKEN:
-                return False, "GITHUB_TOKEN is missing for remote repair"
-            if not info.get("auto_repair_remote", False):
-                return False, "auto repair disabled; mark auto_repair_remote=true explicitly"
-            result = git(path, "remote", "set-url", "origin", target)
-            return (True, f"repaired remote to {target}") if result.returncode == 0 else (False, result.stderr.strip() or "remote repair failed")
+            return False, "broken remote requires explicit repair"
         if status == "mismatch":
             return False, f"remote differs; preserved: {current}"
         return False, f"remote could not be verified; preserved: {detail}"
 
     if not GITHUB_TOKEN:
         return False, "no origin and GITHUB_TOKEN is missing"
+
     exists, detail = github_repo_exists(owner, repo, GITHUB_TOKEN)
     if not exists and detail not in {"not found"}:
         return False, detail
-    if not exists and apply:
+    if not exists:
+        if not AUTO_CREATE_REPOS:
+            return False, f"repo {owner}/{repo} missing and AUTO_CREATE_REPOS=false"
         ok, created = github_create_repo(owner, repo, GITHUB_TOKEN, GITHUB_VISIBILITY != "public")
         if not ok:
             return False, created
         target = created
-    elif not exists:
-        return False, f"repo {owner}/{repo} missing; would create"
-    if not apply:
-        return False, f"no origin; would link {target}"
+
     result = git(path, "remote", "add", "origin", target)
     return (True, f"linked origin {target}") if result.returncode == 0 else (False, result.stderr.strip() or "could not add origin")
 
 
-def ensure_readme(path, name, info, apply):
+def ensure_readme(path, name, info):
     target = Path(path) / "README.md"
     if target.exists():
         return "existing README preserved"
-    if not apply:
-        return "README missing; would create basic README"
     title = name.replace("_", " ").replace("-", " ").title()
-    text = f"# {title}\n\nProject status: **{info.get('status', 'in-progress')}**.\n\nManaged by ProjectHub.\n"
-    target.write_text(text, encoding="utf-8")
-    return "created basic README.md"
+    text = (
+        f"# {title}\n\n"
+        f"Project status: **{info.get('status', 'in-progress')}**.\n\n"
+        "Managed by ProjectHub.\n"
+    )
+    try:
+        target.write_text(text, encoding="utf-8")
+        return "created basic README.md"
+    except OSError as exc:
+        return f"README creation failed: {exc}"
 
 
 def ollama_commit_message(name):
@@ -393,7 +395,13 @@ def ollama_commit_message(name):
     if not model:
         return fallback
     try:
-        req = urllib.request.Request(url, data=json.dumps({"model": model, "prompt": f"Write one concise Conventional Commit message for changes in project {name}. Return only the message.", "stream": False}).encode(), method="POST", headers={"Content-Type": "application/json"})
+        prompt = f"Write one concise Conventional Commit message for changes in project {name}. Return only the message."
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=20) as response:
             text = json.loads(response.read().decode()).get("response", "").strip().splitlines()[0]
         return text[:200] or fallback
@@ -405,6 +413,7 @@ def auto_project(name, info, cache):
     path = info.get("path", "")
     if not os.path.isdir(path):
         return "skipped", "path missing"
+
     current = scan_signature(path)
     previous = cache.get(name)
     if previous is None:
@@ -422,7 +431,7 @@ def auto_project(name, info, cache):
     if not remote_ok:
         return "skipped", remote_detail
 
-    readme_detail = ensure_readme(path, name, info, apply=True)
+    readme_detail = ensure_readme(path, name, info)
     add = git(path, "add", ".")
     if add.returncode:
         return "error", add.stderr.strip() or "git add failed"
