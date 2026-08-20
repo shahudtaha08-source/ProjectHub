@@ -8,6 +8,7 @@
     "validate": "python main.py --validate",
     "open": "python main.py --open",
     "auto": "python main.py --auto",
-    "watch": "python main.py --watch"
+    "watch": "python main.py --watch",
+    "phase5": "python phase5.py"
   }
 }
