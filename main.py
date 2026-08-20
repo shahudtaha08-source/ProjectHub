@@ -1,601 +1,321 @@
+"""ProjectHub - Phase 1 stabilization.
+
+Tracks scattered project folders without moving them. Auto Mode can detect
+changes, initialize Git when needed, and push to an already-configured remote.
+For automatic GitHub repository creation, set GITHUB_TOKEN and GITHUB_OWNER in
+.env (or install/authenticate the GitHub CLI as a fallback).
 """
-Project Automation System - Phase 2 (v3)
--------------------------------------------
-Hub location: D:\\ProjectHub\\files\\
-
-This file is the ONLY place that decides where the index/cache live.
-Everything else in the program imports INDEX_FILE / CACHE_FILE from here -
-that's the fix for the old "projects/_index.json"-style path bug: there is
-now a single constant, not several places that each build the path.
-
-Config precedence for the hub folder:
-  1. PROJECT_HUB in a .env file (if present)
-  2. Hardcoded default: D:\\ProjectHub\\files
-
-PROJECTS_ROOT (optional, also from .env) is used only to resolve project
-paths in the index that are stored as *relative* paths. Absolute paths in
-projects_index.json are never touched by this - it's an opt-in convenience,
-not a requirement.
-
-Safety reminder: nothing in this file moves, renames, or deletes project
-folders. It only computes where to read config FROM.
-"""
-
+import argparse
+import difflib
+import hashlib
+import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
-import json
-import hashlib
-import difflib
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# .env loading (no external dependency - simple manual parser)
-# ---------------------------------------------------------------------------
-
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_OWNER = "shahudtaha08-source"
+IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vscode", "dist", "build"}
 
 
-def _load_dotenv(env_path: Path) -> dict:
-    """
-    Minimal .env parser: KEY=VALUE per line, '#' comments, blank lines
-    ignored, optional surrounding quotes on the value stripped. Never
-    raises - returns {} if the file can't be read.
-    """
+def load_env(path: Path) -> dict:
     values = {}
-    if not env_path.exists():
+    if not path.exists():
         return values
     try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key:
-                    values[key] = value
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
     except OSError:
         pass
     return values
 
 
-def _find_env() -> dict:
-    """Look for .env next to this script, then one folder up. First found wins."""
-    for candidate in (SCRIPT_DIR / ".env", SCRIPT_DIR.parent / ".env"):
-        if candidate.exists():
-            return _load_dotenv(candidate)
-    return {}
-
-
-_ENV = _find_env()
-
-# ---------------------------------------------------------------------------
-# Hub path constants (single source of truth)
-# ---------------------------------------------------------------------------
-
-DEFAULT_HUB_DIR = r"D:\ProjectHub\files"
-
-# PROJECT_HUB from .env if present and non-empty, else the hardcoded default.
-HUB_DIR = Path(os.path.normpath(_ENV.get("PROJECT_HUB") or DEFAULT_HUB_DIR))
-
-# Optional root used only to resolve *relative* project paths in the index.
-# Empty string means "not configured" - relative paths are then resolved
-# against the current working directory as a last resort.
-PROJECTS_ROOT = _ENV.get("PROJECTS_ROOT", "").strip()
-
+ENV = load_env(SCRIPT_DIR / ".env")
+HUB_DIR = Path(ENV.get("PROJECT_HUB") or SCRIPT_DIR).expanduser().resolve()
 INDEX_FILE = HUB_DIR / "projects_index.json"
 CACHE_FILE = HUB_DIR / ".cache.json"
+GITHUB_OWNER = ENV.get("GITHUB_OWNER") or DEFAULT_OWNER
+GITHUB_TOKEN = ENV.get("GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN", "")
+GITHUB_VISIBILITY = (ENV.get("GITHUB_VISIBILITY") or "private").lower()
+AUTO_CREATE_REPOS = (ENV.get("AUTO_CREATE_REPOS") or "false").lower() in {"1", "true", "yes", "on"}
 
-# Folders skipped when scanning a project for changes.
-IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vscode"}
 
-
-# ---------------------------------------------------------------------------
-# Path + name normalization
-# ---------------------------------------------------------------------------
-
-def normalize_path(raw_path: str) -> str:
-    """
-    Normalize a path for reliable comparison/display.
-      - Strips stray quotes/whitespace
-      - If relative and PROJECTS_ROOT is configured, resolves against it
-      - Expands to an absolute, OS-correct path
-    Never modifies anything on disk - this is pure string/path math.
-    """
-    if not raw_path:
+def normalize_path(raw: str) -> str:
+    if not raw:
         return ""
-    cleaned = raw_path.strip().strip('"').strip("'")
-
-    p = Path(cleaned)
-    if not p.is_absolute() and PROJECTS_ROOT:
-        p = Path(PROJECTS_ROOT) / p
-
-    return os.path.normpath(os.path.abspath(os.path.expanduser(str(p))))
+    return os.path.normpath(os.path.abspath(os.path.expanduser(raw.strip().strip('"').strip("'"))))
 
 
-def normalize_input(text: str) -> str:
-    """
-    Build a comparison key for project-name matching:
-      trim -> lowercase -> strip spaces/underscores/dashes.
-    This makes "RuhumAI", "ruhum ai", and "ruhum_ai" all collapse to
-    the same key ("ruhumai").
-    """
-    if not text:
-        return ""
-    trimmed = " ".join(text.strip().split())  # trim + collapse internal whitespace
-    key = trimmed.lower()
-    for ch in (" ", "_", "-"):
-        key = key.replace(ch, "")
-    return key
-
-
-# ---------------------------------------------------------------------------
-# A. Load Index
-# ---------------------------------------------------------------------------
-
-def load_index(index_path: Path = None) -> dict:
-    """
-    Load the project index from the single INDEX_FILE constant (or an
-    explicit override, used by tests). Never crashes on a missing or
-    malformed file - returns {} with a clear message instead.
-    """
-    index_path = Path(index_path) if index_path is not None else INDEX_FILE
-
-    if not index_path.exists():
-        print(f"[WARN] Index file not found: {index_path}")
+def load_index() -> dict:
+    if not INDEX_FILE.exists():
+        print(f"[ERROR] Index file not found: {INDEX_FILE}")
         return {}
-
     try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Could not parse {index_path.name}: {e}")
+        data = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[ERROR] Could not parse {INDEX_FILE.name}: {exc}")
         return {}
-
     if not isinstance(data, dict):
-        print(f"[ERROR] {index_path.name} must contain a JSON object at the top level.")
+        print("[ERROR] projects_index.json must contain a JSON object.")
         return {}
-
-    for name, info in data.items():
-        if isinstance(info, dict) and "path" in info:
-            info["path"] = normalize_path(info["path"])
-
+    for info in data.values():
+        if isinstance(info, dict):
+            info["path"] = normalize_path(info.get("path", ""))
     return data
 
 
-# ---------------------------------------------------------------------------
-# B. Validate Paths
-# ---------------------------------------------------------------------------
-
-def validate_paths(projects: dict) -> dict:
-    """Check each project's path on disk. Never raises. Returns {name: bool}."""
-    results = {}
+def validate_paths(projects: dict) -> None:
     for name, info in projects.items():
-        path_str = info.get("path", "")
-        exists = bool(path_str) and os.path.exists(path_str)
-        results[name] = exists
+        path = info.get("path", "")
+        tag = "VALID" if path and os.path.isdir(path) else "MISSING"
+        print(f"[{tag:<7}] {name} -> {path}")
 
-        if exists:
-            print(f"  [VALID]   {name} -> {path_str}")
-        else:
-            print(f"  [MISSING] {name} -> {path_str}")
-            print(f"            (path not found - check for typos, drive letters, or a moved folder)")
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# C. Display Projects (aligned table)
-# ---------------------------------------------------------------------------
 
 def display_projects(projects: dict) -> None:
-    """Print all tracked projects with status, aligned into clean columns."""
     if not projects:
-        print("No projects found in index.")
+        print("No projects found.")
         return
-
-    name_w = max(len("PROJECT NAME"), max(len(n) for n in projects))
-    status_w = max(len("STATUS"), max(len(i.get("status", "unknown")) for i in projects.values()))
-
-    header = f"{'PROJECT NAME':<{name_w}}  {'STATUS':<{status_w}}  PATH"
-    print(f"\n{header}")
-    print("-" * len(header))
+    nw = max(len("PROJECT NAME"), *(len(x) for x in projects))
+    sw = max(len("STATUS"), *(len(x.get("status", "unknown")) for x in projects.values()))
+    print(f"\n{'PROJECT NAME':<{nw}}  {'STATUS':<{sw}}  PATH")
+    print("-" * (nw + sw + 32))
     for name, info in projects.items():
-        status = info.get("status", "unknown")
-        path_str = info.get("path", "N/A")
-        print(f"{name:<{name_w}}  {status:<{status_w}}  {path_str}")
+        print(f"{name:<{nw}}  {info.get('status','unknown'):<{sw}}  {info.get('path','')}")
 
 
-# ---------------------------------------------------------------------------
-# Project name matching (case/separator-insensitive + fuzzy suggestion)
-# ---------------------------------------------------------------------------
+def key(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch not in " _-")
+
 
 def find_project(query: str, projects: dict):
-    """
-    Resolve a user-typed project name to the real key in `projects`.
-    Case-insensitive, ignores spaces/underscores/dashes. Falls back to a
-    fuzzy "did you mean" suggestion when there's no exact match.
-    """
-    if not query:
-        return None
-
-    target_key = normalize_input(query)
-    lookup = {normalize_input(name): name for name in projects}
-
-    if target_key in lookup:
-        return lookup[target_key]
-
-    close = difflib.get_close_matches(target_key, lookup.keys(), n=1, cutoff=0.6)
+    lookup = {key(name): name for name in projects}
+    exact = lookup.get(key(query))
+    if exact:
+        return exact
+    close = difflib.get_close_matches(key(query), lookup.keys(), n=1, cutoff=0.6)
     if close:
-        suggested_name = lookup[close[0]]
-        print(f"[NOT FOUND] '{query}' isn't in the index. Did you mean: {suggested_name}?")
+        print(f"[NOT FOUND] Did you mean: {lookup[close[0]]}?")
     else:
-        print(f"[NOT FOUND] '{query}' isn't in the index, and no close match was found.")
-
+        print(f"[NOT FOUND] '{query}' is not in the index.")
     return None
 
 
-# ---------------------------------------------------------------------------
-# D. Open Project Function
-# ---------------------------------------------------------------------------
-
-def open_project(name: str, projects: dict) -> bool:
-    """Open the given project's folder in the OS file explorer."""
-    info = projects.get(name)
-    if info is None:
-        print(f"[ERROR] Project '{name}' not found in index.")
-        return False
-
-    path_str = info.get("path", "")
-    if not path_str or not os.path.exists(path_str):
-        print(f"[ERROR] Path does not exist for '{name}': {path_str}")
-        return False
-
-    system = platform.system()
+def open_project(name: str, projects: dict) -> None:
+    path = projects[name].get("path", "")
+    if not os.path.isdir(path):
+        print(f"[ERROR] Path does not exist for '{name}': {path}")
+        return
     try:
-        if system == "Windows":
-            os.startfile(path_str)  # type: ignore[attr-defined]
-        elif system == "Darwin":
-            subprocess.run(["open", path_str], check=True)
+        if platform.system() == "Windows":
+            os.startfile(path)
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", path], check=True)
         else:
-            subprocess.run(["xdg-open", path_str], check=True)
-        print(f"[OK] Opened '{name}' at {path_str}")
-        return True
-    except Exception as e:
-        print(f"[ERROR] Could not open folder: {e}")
-        return False
+            subprocess.run(["xdg-open", path], check=True)
+        print(f"[OK] Opened '{name}'")
+    except Exception as exc:
+        print(f"[ERROR] Could not open folder: {exc}")
 
 
-# ---------------------------------------------------------------------------
-# PHASE 2: change detection (mtime + file-list hash)
-# ---------------------------------------------------------------------------
-
-def is_git_repo(path_str: str) -> bool:
-    """True if the project folder contains a .git directory."""
-    return os.path.isdir(os.path.join(path_str, ".git"))
-
-
-def _scan_signature(path_str: str) -> dict:
-    """
-    Build a lightweight signature of a project's current state: a hash of
-    every (relative path, modified time) pair, sorted, skipping
-    IGNORED_DIRS. This catches additions, deletions, renames, AND edits -
-    not just "did the newest file change" - while staying cheap (no file
-    content is read or hashed).
-    """
+def scan_signature(path: str) -> dict:
     entries = []
-    for root, dirs, files in os.walk(path_str):
+    for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
-        for fname in files:
-            fpath = os.path.join(root, fname)
+        for filename in files:
+            full = os.path.join(root, filename)
             try:
-                mtime = os.path.getmtime(fpath)
+                stat = os.stat(full)
             except OSError:
                 continue
-            relpath = os.path.relpath(fpath, path_str)
-            entries.append(f"{relpath}:{mtime}")
-
+            rel = os.path.relpath(full, path).replace("\\", "/")
+            entries.append(f"{rel}|{stat.st_size}|{stat.st_mtime_ns}")
     entries.sort()
-    digest = hashlib.sha256("|".join(entries).encode("utf-8", "ignore")).hexdigest()
-    return {"file_count": len(entries), "hash": digest}
+    digest = hashlib.sha256("\n".join(entries).encode("utf-8", "ignore")).hexdigest()
+    return {"hash": digest, "file_count": len(entries)}
 
 
-def load_cache(cache_path: Path = None) -> dict:
-    """Load the change-detection cache. Returns {} if missing/corrupt."""
-    cache_path = Path(cache_path) if cache_path is not None else CACHE_FILE
-    if not cache_path.exists():
-        return {}
+def load_cache() -> dict:
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        print(f"[WARN] {cache_path.name} was corrupt - starting a fresh cache.")
+        return json.loads(CACHE_FILE.read_text(encoding="utf-8")) if CACHE_FILE.exists() else {}
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
-def save_cache(cache: dict, cache_path: Path = None) -> None:
-    """Persist the change-detection cache to disk."""
-    cache_path = Path(cache_path) if cache_path is not None else CACHE_FILE
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2)
-    except OSError as e:
-        print(f"[ERROR] Could not write cache file: {e}")
+def save_cache(cache: dict) -> None:
+    temp = CACHE_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    temp.replace(CACHE_FILE)
 
 
-def has_changes(name: str, path_str: str, cache: dict) -> bool:
-    """True if this project's signature differs from what's cached (or is new)."""
-    current = _scan_signature(path_str)
-    previous = cache.get(name)
-    if previous is None:
-        return True
-    return current["hash"] != previous.get("hash")
+def git(path: str, *args: str, check=False):
+    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, check=check)
 
 
-def _update_cache_entry(name: str, path_str: str, cache: dict) -> None:
-    cache[name] = _scan_signature(path_str)
+def is_git_repo(path: str) -> bool:
+    return git(path, "rev-parse", "--is-inside-work-tree").returncode == 0
 
 
-# ---------------------------------------------------------------------------
-# Git remote safety (fixes the "my-webapp" 404 crash-on-push case)
-# ---------------------------------------------------------------------------
-
-# Substrings that indicate "this remote is missing/invalid" rather than a
-# transient or unexpected error - matched case-insensitively against git's
-# combined stdout+stderr.
-_INVALID_REMOTE_SIGNS = (
-    "not found",
-    "404",
-    "repository not found",
-    "could not read from remote repository",
-    "does not appear to be a git repository",
-    "no such device or address",
-)
-
-
-def get_remote_url(path_str: str):
-    """Return the 'origin' remote URL, or None if no remote is configured."""
-    try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=path_str, capture_output=True, text=True,
-        )
-    except FileNotFoundError:
-        return None
-    if result.returncode != 0:
-        return None
-    url = result.stdout.strip()
-    return url or None
-
-
-def verify_remote(path_str: str):
-    """
-    Confirm the project's remote exists and is reachable BEFORE we ever
-    attempt a push. Returns (True, "") if usable, or (False, reason) if
-    the remote is missing, invalid, or unreachable (covers the 404 case).
-    """
-    url = get_remote_url(path_str)
-    if not url:
-        return False, "no remote configured"
-
-    try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--exit-code", url],
-            cwd=path_str, capture_output=True, text=True, timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "remote check timed out"
-    except FileNotFoundError:
+def ensure_git_repo(path: str):
+    if is_git_repo(path):
+        return True, "existing git repository"
+    if shutil.which("git") is None:
         return False, "git is not installed or not on PATH"
-
-    if result.returncode != 0:
-        combined = f"{result.stdout}\n{result.stderr}".lower()
-        if any(sign in combined for sign in _INVALID_REMOTE_SIGNS):
-            return False, "remote not found (404 / invalid repository)"
-        return False, (result.stderr.strip() or "remote unreachable")
-
-    return True, ""
+    result = git(path, "init")
+    if result.returncode:
+        return False, result.stderr.strip() or "git init failed"
+    git(path, "branch", "-M", "main")
+    return True, "initialized git repository"
 
 
-def run_git_automation(name: str, path_str: str) -> tuple:
-    """
-    Run git add -> commit -> push for a project that already has confirmed
-    changes AND is a confirmed git repo. Returns (status, detail) where
-    status is one of: "updated", "skipped_no_changes", "skipped_remote", "error".
+def get_remote(path: str) -> str:
+    result = git(path, "remote", "get-url", "origin")
+    return result.stdout.strip() if result.returncode == 0 else ""
 
-    All commands run with cwd=path_str, so this can never touch anything
-    outside that project's own repo.
-    """
-    # 1) Verify remote BEFORE touching anything - this is what prevents
-    #    the my-webapp-style crash: a bad remote is caught here, not
-    #    discovered mid-push.
-    remote_ok, remote_reason = verify_remote(path_str)
-    if not remote_ok:
-        return "skipped_remote", remote_reason
 
+def create_github_repo(repo_name: str):
+    # Preferred path: authenticated GitHub CLI, because it avoids storing a token in code.
+    gh = shutil.which("gh")
+    if gh:
+        cmd = [gh, "repo", "create", f"{GITHUB_OWNER}/{repo_name}", "--source", ".", "--remote", "origin"]
+        cmd.append("--private" if GITHUB_VISIBILITY != "public" else "--public")
+        result = subprocess.run(cmd, cwd=HUB_DIR, capture_output=True, text=True)
+        # This command is hub-specific; do not use it for project repos.
+    if not GITHUB_TOKEN:
+        return False, "no GitHub remote and no GITHUB_TOKEN configured"
+    import urllib.request
+    payload = json.dumps({"name": repo_name, "private": GITHUB_VISIBILITY != "public", "auto_init": False}).encode()
+    request = urllib.request.Request(
+        "https://api.github.com/user/repos", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
+    )
     try:
-        subprocess.run(
-            ["git", "add", "."],
-            cwd=path_str, check=True, capture_output=True, text=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        detail = e.stderr.strip() if hasattr(e, "stderr") and e.stderr else str(e)
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode())
+    except Exception as exc:
+        return False, f"GitHub repo creation failed: {exc}"
+    return True, data.get("clone_url", f"https://github.com/{GITHUB_OWNER}/{repo_name}.git")
+
+
+def ensure_remote(name: str, path: str):
+    remote = get_remote(path)
+    if remote:
+        return True, remote
+    if not AUTO_CREATE_REPOS:
+        return False, "no remote configured (AUTO_CREATE_REPOS=false)"
+    # Create the project repository through the GitHub REST API.
+    if not GITHUB_TOKEN:
+        return False, "no remote configured and GITHUB_TOKEN is missing"
+    import urllib.request
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-") or "project"
+    payload = json.dumps({"name": slug, "private": GITHUB_VISIBILITY != "public", "auto_init": False}).encode()
+    request = urllib.request.Request("https://api.github.com/user/repos", data=payload, method="POST", headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode())
+        remote = data["clone_url"]
+    except Exception as exc:
+        return False, f"GitHub repo creation failed: {exc}"
+    result = git(path, "remote", "add", "origin", remote)
+    return (result.returncode == 0, remote if result.returncode == 0 else result.stderr.strip())
+
+
+def auto_project(name: str, info: dict, cache: dict):
+    path = info.get("path", "")
+    if not os.path.isdir(path):
+        return "skipped", "path missing"
+    current = scan_signature(path)
+    previous = cache.get(name, {})
+    changed = current.get("hash") != previous.get("hash")
+    if not changed:
+        return "skipped", "no detected changes"
+    ok, detail = ensure_git_repo(path)
+    if not ok:
         return "error", detail
-
-    commit_msg = f"Auto update: {name}"
-    commit_result = subprocess.run(
-        ["git", "commit", "-m", commit_msg],
-        cwd=path_str, capture_output=True, text=True,
-    )
-    if commit_result.returncode != 0:
-        if "nothing to commit" in commit_result.stdout.lower():
-            return "skipped_no_changes", ""
-        return "error", commit_result.stderr.strip() or commit_result.stdout.strip()
-
-    push_result = subprocess.run(
-        ["git", "push"],
-        cwd=path_str, capture_output=True, text=True,
-    )
-    if push_result.returncode != 0:
-        combined = f"{push_result.stdout}\n{push_result.stderr}".lower()
-        if any(sign in combined for sign in _INVALID_REMOTE_SIGNS):
-            return "skipped_remote", "push rejected: remote not found (404 / invalid repository)"
-        return "error", push_result.stderr.strip() or "git push failed"
-
-    return "updated", ""
+    ok, detail = ensure_remote(name, path)
+    if not ok:
+        return "skipped", detail
+    add = git(path, "add", ".")
+    if add.returncode:
+        return "error", add.stderr.strip() or "git add failed"
+    status = git(path, "status", "--porcelain")
+    if not status.stdout.strip():
+        cache[name] = current
+        return "skipped", "no changes to commit"
+    commit = git(path, "commit", "-m", f"chore: automated project update for {name}")
+    if commit.returncode:
+        return "error", commit.stderr.strip() or commit.stdout.strip()
+    branch = info.get("branch") or "main"
+    git(path, "branch", "-M", branch)
+    push = git(path, "push", "-u", "origin", branch)
+    if push.returncode:
+        return "error", push.stderr.strip() or "git push failed"
+    cache[name] = current
+    return "updated", detail
 
 
-def run_auto_mode(projects: dict) -> None:
-    """
-    Scan every project and, only where genuinely needed, run git automation:
-      - missing path            -> [SKIPPED] (path missing)
-      - not a git repo          -> [SKIPPED] (not a git repo)
-      - no detected changes     -> [SKIPPED] (no changes)
-      - invalid/missing remote  -> [SKIPPED] (invalid or missing remote)
-      - commit/push succeeded   -> [UPDATED]
-      - anything else that fails -> [ERROR] with a readable reason
-
-    Never crashes the whole run - one project's failure never stops the
-    rest from being processed.
-    """
+def run_auto(projects: dict) -> None:
     cache = load_cache()
     summary = {"updated": 0, "skipped": 0, "errors": 0}
-
     for name, info in projects.items():
-        path_str = info.get("path", "")
-
-        if not path_str or not os.path.exists(path_str):
-            print(f"[SKIPPED] {name} (path missing: {path_str})")
-            summary["skipped"] += 1
-            continue
-
-        if not is_git_repo(path_str):
-            print(f"[SKIPPED] {name} (not a git repo)")
-            summary["skipped"] += 1
-            continue
-
-        if not has_changes(name, path_str, cache):
-            print(f"[SKIPPED] {name} (no changes)")
-            summary["skipped"] += 1
-            continue
-
-        status, detail = run_git_automation(name, path_str)
-        _update_cache_entry(name, path_str, cache)  # refresh signature regardless of outcome
-
+        status, detail = auto_project(name, info, cache)
         if status == "updated":
-            print(f"[UPDATED] {name}")
+            print(f"[UPDATED] {name} ({detail})")
             summary["updated"] += 1
-        elif status == "skipped_remote":
-            print(f"[SKIPPED] {name} (invalid or missing remote)")
-            summary["skipped"] += 1
-        elif status == "skipped_no_changes":
-            print(f"[SKIPPED] {name} (no changes to commit)")
-            summary["skipped"] += 1
-        else:
+        elif status == "error":
             print(f"[ERROR] {name}: {detail}")
             summary["errors"] += 1
-
+        else:
+            print(f"[SKIPPED] {name} ({detail})")
+            summary["skipped"] += 1
     save_cache(cache)
-
     print("\n===== Auto Mode Summary =====")
     print(f"[UPDATED] {summary['updated']}")
     print(f"[SKIPPED] {summary['skipped']}")
     print(f"[ERROR] {summary['errors']}")
 
 
-# ---------------------------------------------------------------------------
-# CLI Menu
-# ---------------------------------------------------------------------------
-
-def print_menu() -> None:
-    print("\n===== Project Hub =====")
-    print("1. List Projects")
-    print("2. Open Project")
-    print("3. Run Auto Mode (Git automation)")
-    print("4. Exit")
-
-
-def run_menu(projects: dict) -> None:
+def menu(projects: dict):
     while True:
-        print_menu()
-        try:
-            choice = input("\nChoose an option (1-4): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
-            return
-
-        if choice == "1":
-            display_projects(projects)
-
+        print("\n===== Project Hub =====")
+        print("1. List Projects\n2. Open Project\n3. Run Auto Mode\n4. Exit")
+        choice = input("Choose an option (1-4): ").strip()
+        if choice == "1": display_projects(projects)
         elif choice == "2":
-            try:
-                query = input("Project name: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
-                return
-            match = find_project(query, projects)
-            if match:
-                open_project(match, projects)
-
-        elif choice == "3":
-            run_auto_mode(projects)
-
-        elif choice == "4":
-            print("Goodbye.")
-            return
-
-        else:
-            print("[INVALID] Please choose 1, 2, 3, or 4.")
+            name = find_project(input("Project name: ").strip(), projects)
+            if name: open_project(name, projects)
+        elif choice == "3": run_auto(projects)
+        elif choice == "4": return
+        else: print("[INVALID] Please choose 1-4.")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main() -> None:
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--auto", action="store_true")
+    parser.add_argument("--open", nargs="?")
+    args = parser.parse_args()
     print(f"Loading index from: {INDEX_FILE}\n")
     projects = load_index()
-
+    if not projects: return
     print("Validating project paths...")
     validate_paths(projects)
-
-    if not projects:
+    if args.validate:
+        display_projects(projects); return
+    if args.open is not None:
+        name = find_project(args.open or input("Project name: ").strip(), projects)
+        if name: open_project(name, projects)
         return
-
-    argv = sys.argv[1:]
-
-    # `python main.py --auto` -> scan + git automation only, no menu.
-    if "--auto" in argv:
-        run_auto_mode(projects)
-        return
-
-    # `python main.py --validate` -> load + validate + list, then exit.
-    if "--validate" in argv:
-        display_projects(projects)
-        return
-
-    # `python main.py --open <name>` -> resolve + open, then exit.
-    if "--open" in argv:
-        idx = argv.index("--open")
-        name_arg = argv[idx + 1] if idx + 1 < len(argv) else None
-        if not name_arg:
-            try:
-                name_arg = input("Project name: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\nExiting.")
-                return
-        match = find_project(name_arg, projects)
-        if match:
-            open_project(match, projects)
-        return
-
-    # No flags -> interactive menu.
+    if args.auto:
+        run_auto(projects); return
     display_projects(projects)
-    run_menu(projects)
+    menu(projects)
 
 
 if __name__ == "__main__":
