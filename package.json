@@ -1,0 +1,12 @@
+{
+  "name": "project-hub",
+  "version": "1.0.0",
+  "description": "Node launcher for the Project Hub Python automation system. Contains no logic of its own - every script just runs main.py.",
+  "private": true,
+  "scripts": {
+    "start": "python main.py",
+    "validate": "python main.py --validate",
+    "open": "python main.py --open",
+    "auto": "python main.py --auto"
+  }
+}
