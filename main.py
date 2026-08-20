@@ -1,9 +1,9 @@
-"""ProjectHub - Phase 1 stabilization.
+"""ProjectHub - Phase 1 stabilization and watch mode.
 
-Tracks scattered project folders without moving them. Auto Mode can detect
-changes, initialize Git when needed, and push to an already-configured remote.
-For automatic GitHub repository creation, set GITHUB_TOKEN and GITHUB_OWNER in
-.env (or install/authenticate the GitHub CLI as a fallback).
+Tracks scattered project folders without moving them. Auto Mode detects project
+changes, initializes Git when needed, optionally creates a GitHub repository,
+commits, and pushes. Watch Mode uses polling so it needs no third-party Python
+package and debounces noisy batch changes such as ZIP extraction.
 """
 import argparse
 import difflib
@@ -13,12 +13,17 @@ import os
 import platform
 import shutil
 import subprocess
-import sys
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OWNER = "shahudtaha08-source"
-IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vscode", "dist", "build"}
+IGNORED_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    ".idea", ".vscode", "dist", "build",
+}
 
 
 def load_env(path: Path) -> dict:
@@ -45,6 +50,8 @@ GITHUB_OWNER = ENV.get("GITHUB_OWNER") or DEFAULT_OWNER
 GITHUB_TOKEN = ENV.get("GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN", "")
 GITHUB_VISIBILITY = (ENV.get("GITHUB_VISIBILITY") or "private").lower()
 AUTO_CREATE_REPOS = (ENV.get("AUTO_CREATE_REPOS") or "false").lower() in {"1", "true", "yes", "on"}
+WATCH_INTERVAL = max(1.0, float(ENV.get("WATCH_INTERVAL_SECONDS") or "5"))
+WATCH_DEBOUNCE = max(2.0, float(ENV.get("WATCH_DEBOUNCE_SECONDS") or "10"))
 
 
 def normalize_path(raw: str) -> str:
@@ -65,10 +72,15 @@ def load_index() -> dict:
     if not isinstance(data, dict):
         print("[ERROR] projects_index.json must contain a JSON object.")
         return {}
-    for info in data.values():
-        if isinstance(info, dict):
-            info["path"] = normalize_path(info.get("path", ""))
-    return data
+    projects = {}
+    for name, info in data.items():
+        if not isinstance(info, dict):
+            print(f"[WARN] Skipping invalid project entry: {name}")
+            continue
+        info = dict(info)
+        info["path"] = normalize_path(info.get("path", ""))
+        projects[name] = info
+    return projects
 
 
 def validate_paths(projects: dict) -> None:
@@ -87,7 +99,7 @@ def display_projects(projects: dict) -> None:
     print(f"\n{'PROJECT NAME':<{nw}}  {'STATUS':<{sw}}  PATH")
     print("-" * (nw + sw + 32))
     for name, info in projects.items():
-        print(f"{name:<{nw}}  {info.get('status','unknown'):<{sw}}  {info.get('path','')}")
+        print(f"{name:<{nw}}  {info.get('status', 'unknown'):<{sw}}  {info.get('path', '')}")
 
 
 def key(text: str) -> str:
@@ -114,7 +126,7 @@ def open_project(name: str, projects: dict) -> None:
         return
     try:
         if platform.system() == "Windows":
-            os.startfile(path)
+            os.startfile(path)  # type: ignore[attr-defined]
         elif platform.system() == "Darwin":
             subprocess.run(["open", path], check=True)
         else:
@@ -149,20 +161,23 @@ def load_cache() -> dict:
 
 
 def save_cache(cache: dict) -> None:
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     temp = CACHE_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    temp.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
     temp.replace(CACHE_FILE)
 
 
-def git(path: str, *args: str, check=False):
-    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, check=check)
+def git(path: str, *args: str):
+    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True)
 
 
 def is_git_repo(path: str) -> bool:
+    if shutil.which("git") is None:
+        return False
     return git(path, "rev-parse", "--is-inside-work-tree").returncode == 0
 
 
-def ensure_git_repo(path: str):
+def ensure_git_repo(path: str, branch: str):
     if is_git_repo(path):
         return True, "existing git repository"
     if shutil.which("git") is None:
@@ -170,7 +185,9 @@ def ensure_git_repo(path: str):
     result = git(path, "init")
     if result.returncode:
         return False, result.stderr.strip() or "git init failed"
-    git(path, "branch", "-M", "main")
+    branch_result = git(path, "branch", "-M", branch or "main")
+    if branch_result.returncode:
+        return False, branch_result.stderr.strip() or "could not set initial branch"
     return True, "initialized git repository"
 
 
@@ -179,28 +196,46 @@ def get_remote(path: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def create_github_repo(repo_name: str):
-    # Preferred path: authenticated GitHub CLI, because it avoids storing a token in code.
-    gh = shutil.which("gh")
-    if gh:
-        cmd = [gh, "repo", "create", f"{GITHUB_OWNER}/{repo_name}", "--source", ".", "--remote", "origin"]
-        cmd.append("--private" if GITHUB_VISIBILITY != "public" else "--public")
-        result = subprocess.run(cmd, cwd=HUB_DIR, capture_output=True, text=True)
-        # This command is hub-specific; do not use it for project repos.
+def repo_slug(name: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name)
+    slug = "-".join(part for part in slug.split("-") if part)
+    return slug or "project"
+
+
+def github_api_create_repo(name: str):
     if not GITHUB_TOKEN:
-        return False, "no GitHub remote and no GITHUB_TOKEN configured"
-    import urllib.request
-    payload = json.dumps({"name": repo_name, "private": GITHUB_VISIBILITY != "public", "auto_init": False}).encode()
+        return False, "GITHUB_TOKEN is missing"
+    payload = json.dumps({
+        "name": name,
+        "private": GITHUB_VISIBILITY != "public",
+        "auto_init": False,
+    }).encode("utf-8")
     request = urllib.request.Request(
-        "https://api.github.com/user/repos", data=payload, method="POST",
-        headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
+        "https://api.github.com/user/repos",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "ProjectHub",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode())
+            data = json.loads(response.read().decode("utf-8"))
+        return True, data["clone_url"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 422:
+            # Repository may already exist; link the predictable owner/repo URL.
+            return True, f"https://github.com/{GITHUB_OWNER}/{name}.git"
+        try:
+            detail = exc.read().decode("utf-8", "ignore")
+        except Exception:
+            detail = ""
+        return False, f"GitHub API HTTP {exc.code}: {detail or exc.reason}"
     except Exception as exc:
         return False, f"GitHub repo creation failed: {exc}"
-    return True, data.get("clone_url", f"https://github.com/{GITHUB_OWNER}/{repo_name}.git")
 
 
 def ensure_remote(name: str, path: str):
@@ -209,21 +244,14 @@ def ensure_remote(name: str, path: str):
         return True, remote
     if not AUTO_CREATE_REPOS:
         return False, "no remote configured (AUTO_CREATE_REPOS=false)"
-    # Create the project repository through the GitHub REST API.
-    if not GITHUB_TOKEN:
-        return False, "no remote configured and GITHUB_TOKEN is missing"
-    import urllib.request
-    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-") or "project"
-    payload = json.dumps({"name": slug, "private": GITHUB_VISIBILITY != "public", "auto_init": False}).encode()
-    request = urllib.request.Request("https://api.github.com/user/repos", data=payload, method="POST", headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode())
-        remote = data["clone_url"]
-    except Exception as exc:
-        return False, f"GitHub repo creation failed: {exc}"
-    result = git(path, "remote", "add", "origin", remote)
-    return (result.returncode == 0, remote if result.returncode == 0 else result.stderr.strip())
+    slug = repo_slug(name)
+    ok, detail = github_api_create_repo(slug)
+    if not ok:
+        return False, detail
+    result = git(path, "remote", "add", "origin", detail)
+    if result.returncode:
+        return False, result.stderr.strip() or "could not add GitHub remote"
+    return True, f"created/linked {detail}"
 
 
 def auto_project(name: str, info: dict, cache: dict):
@@ -232,38 +260,48 @@ def auto_project(name: str, info: dict, cache: dict):
         return "skipped", "path missing"
     current = scan_signature(path)
     previous = cache.get(name, {})
-    changed = current.get("hash") != previous.get("hash")
-    if not changed:
+    if current.get("hash") == previous.get("hash"):
         return "skipped", "no detected changes"
-    ok, detail = ensure_git_repo(path)
+
+    branch = str(info.get("branch") or "main")
+    ok, detail = ensure_git_repo(path, branch)
     if not ok:
         return "error", detail
     ok, detail = ensure_remote(name, path)
     if not ok:
         return "skipped", detail
+
     add = git(path, "add", ".")
     if add.returncode:
         return "error", add.stderr.strip() or "git add failed"
     status = git(path, "status", "--porcelain")
+    if status.returncode:
+        return "error", status.stderr.strip() or "git status failed"
     if not status.stdout.strip():
         cache[name] = current
-        return "skipped", "no changes to commit"
+        return "skipped", "filesystem changed only in ignored files"
+
     commit = git(path, "commit", "-m", f"chore: automated project update for {name}")
     if commit.returncode:
         return "error", commit.stderr.strip() or commit.stdout.strip()
-    branch = info.get("branch") or "main"
-    git(path, "branch", "-M", branch)
-    push = git(path, "push", "-u", "origin", branch)
+
+    current_branch = git(path, "branch", "--show-current")
+    active_branch = current_branch.stdout.strip() or branch
+    push = git(path, "push", "-u", "origin", active_branch)
     if push.returncode:
         return "error", push.stderr.strip() or "git push failed"
+
     cache[name] = current
     return "updated", detail
 
 
-def run_auto(projects: dict) -> None:
+def run_auto(projects: dict, only_names=None) -> None:
     cache = load_cache()
     summary = {"updated": 0, "skipped": 0, "errors": 0}
+    allowed = set(only_names) if only_names else None
     for name, info in projects.items():
+        if allowed is not None and name not in allowed:
+            continue
         status, detail = auto_project(name, info, cache)
         if status == "updated":
             print(f"[UPDATED] {name} ({detail})")
@@ -281,39 +319,94 @@ def run_auto(projects: dict) -> None:
     print(f"[ERROR] {summary['errors']}")
 
 
+def watch_projects(projects: dict) -> None:
+    """Poll scattered projects and process each only after its changes are stable."""
+    print(f"[WATCH] Interval: {WATCH_INTERVAL:.1f}s | Debounce: {WATCH_DEBOUNCE:.1f}s")
+    print("[WATCH] Baseline scan started. Press Ctrl+C to stop.")
+    observed = {}
+    pending = {}
+    for name, info in projects.items():
+        path = info.get("path", "")
+        observed[name] = scan_signature(path) if os.path.isdir(path) else None
+
+    try:
+        while True:
+            now = time.monotonic()
+            for name, info in projects.items():
+                path = info.get("path", "")
+                current = scan_signature(path) if os.path.isdir(path) else None
+                if current != observed.get(name):
+                    observed[name] = current
+                    pending[name] = now  # reset debounce on every new change
+                    print(f"[DETECTED] {name}")
+
+            ready = [name for name, changed_at in pending.items() if now - changed_at >= WATCH_DEBOUNCE]
+            for name in ready:
+                pending.pop(name, None)
+                print(f"[PROCESSING] {name} (changes stable)")
+                run_auto(projects, only_names=[name])
+                path = projects[name].get("path", "")
+                observed[name] = scan_signature(path) if os.path.isdir(path) else None
+            time.sleep(WATCH_INTERVAL)
+    except KeyboardInterrupt:
+        print("\n[WATCH] Stopped.")
+
+
 def menu(projects: dict):
     while True:
         print("\n===== Project Hub =====")
-        print("1. List Projects\n2. Open Project\n3. Run Auto Mode\n4. Exit")
-        choice = input("Choose an option (1-4): ").strip()
-        if choice == "1": display_projects(projects)
+        print("1. List Projects\n2. Open Project\n3. Run Auto Mode\n4. Watch Projects\n5. Exit")
+        try:
+            choice = input("Choose an option (1-5): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            return
+        if choice == "1":
+            display_projects(projects)
         elif choice == "2":
             name = find_project(input("Project name: ").strip(), projects)
-            if name: open_project(name, projects)
-        elif choice == "3": run_auto(projects)
-        elif choice == "4": return
-        else: print("[INVALID] Please choose 1-4.")
+            if name:
+                open_project(name, projects)
+        elif choice == "3":
+            run_auto(projects)
+        elif choice == "4":
+            watch_projects(projects)
+        elif choice == "5":
+            print("Goodbye.")
+            return
+        else:
+            print("[INVALID] Please choose 1-5.")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--auto", action="store_true")
+    parser.add_argument("--watch", action="store_true")
     parser.add_argument("--open", nargs="?")
     args = parser.parse_args()
+
     print(f"Loading index from: {INDEX_FILE}\n")
     projects = load_index()
-    if not projects: return
+    if not projects:
+        return
     print("Validating project paths...")
     validate_paths(projects)
+
     if args.validate:
-        display_projects(projects); return
+        display_projects(projects)
+        return
     if args.open is not None:
         name = find_project(args.open or input("Project name: ").strip(), projects)
-        if name: open_project(name, projects)
+        if name:
+            open_project(name, projects)
         return
     if args.auto:
-        run_auto(projects); return
+        run_auto(projects)
+        return
+    if args.watch:
+        watch_projects(projects)
+        return
     display_projects(projects)
     menu(projects)
 
