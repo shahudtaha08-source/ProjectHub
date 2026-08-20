@@ -1,10 +1,11 @@
-"""ProjectHub - Phase 1 stabilization, rename detection and watch mode."""
+"""ProjectHub - project registry, change detection and safe GitHub automation."""
 import argparse
 import difflib
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -174,9 +175,12 @@ def open_project(name, projects):
         print(f"[ERROR] Path does not exist for '{name}': {path}")
         return
     try:
-        if platform.system() == "Windows": os.startfile(path)
-        elif platform.system() == "Darwin": subprocess.run(["open", path], check=True)
-        else: subprocess.run(["xdg-open", path], check=True)
+        if platform.system() == "Windows":
+            os.startfile(path)
+        elif platform.system() == "Darwin":
+            subprocess.run(["open", path], check=True)
+        else:
+            subprocess.run(["xdg-open", path], check=True)
         print(f"[OK] Opened '{name}'")
     except Exception as exc:
         print(f"[ERROR] Could not open folder: {exc}")
@@ -239,101 +243,209 @@ def get_remote(path):
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def repo_slug(name):
-    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in name)
-    return "-".join(x for x in slug.split("-") if x) or "project"
+def repo_slug(name, info):
+    configured = info.get("github_repo") or info.get("repo")
+    if configured:
+        return str(configured)
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "project"
 
 
-def github_api_create_repo(name):
-    if not GITHUB_TOKEN:
-        return False, "GITHUB_TOKEN is missing"
-    payload = json.dumps({"name": name, "private": GITHUB_VISIBILITY != "public", "auto_init": False}).encode()
-    request = urllib.request.Request(
-        "https://api.github.com/user/repos",
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "ProjectHub",
-        },
-    )
+def github_api_request(method, url, token, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "ProjectHub",
+        "Content-Type": "application/json",
+    })
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode())
-        return True, data["clone_url"]
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return response.status, json.loads(response.read().decode() or "{}")
     except urllib.error.HTTPError as exc:
-        if exc.code == 422:
-            return True, f"https://github.com/{GITHUB_OWNER}/{name}.git"
-        return False, f"GitHub API HTTP {exc.code}: {exc.reason}"
+        return exc.code, {"message": exc.read().decode(errors="replace") or exc.reason}
     except Exception as exc:
-        return False, f"GitHub repo creation failed: {exc}"
+        return 0, {"message": str(exc)}
 
 
-def ensure_remote(name, path):
-    remote = get_remote(path)
-    if remote:
-        return True, remote
-    if not AUTO_CREATE_REPOS:
-        return False, "no remote configured (AUTO_CREATE_REPOS=false)"
-    ok, detail = github_api_create_repo(repo_slug(name))
-    if not ok:
+def github_repo_exists(owner, repo, token):
+    if not token:
+        return False, "GITHUB_TOKEN is missing"
+    code, data = github_api_request("GET", f"https://api.github.com/repos/{owner}/{repo}", token)
+    if code == 200:
+        return True, "exists"
+    if code == 404:
+        return False, "not found"
+    return False, f"GitHub API HTTP {code}: {data.get('message', 'unknown error')}"
+
+
+def github_create_repo(owner, repo, token, private=True):
+    if not token:
+        return False, "GITHUB_TOKEN is missing"
+    code, data = github_api_request("POST", "https://api.github.com/user/repos", token, {
+        "name": repo,
+        "private": private,
+        "auto_init": False,
+    })
+    if code in (200, 201):
+        return True, data.get("clone_url", f"https://github.com/{owner}/{repo}.git")
+    if code == 422:
+        exists, detail = github_repo_exists(owner, repo, token)
+        if exists:
+            return True, f"https://github.com/{owner}/{repo}.git"
         return False, detail
-    result = git(path, "remote", "add", "origin", detail)
-    if result.returncode:
-        return False, result.stderr.strip() or "could not add GitHub remote"
-    return True, f"created/linked {detail}"
+    return False, f"GitHub API HTTP {code}: {data.get('message', 'repository creation failed')}"
 
 
-def ensure_initial_commit(path, project_name, created_repo):
-    status = git(path, "status", "--porcelain")
-    if status.returncode:
-        return False, status.stderr.strip() or "git status failed"
-    if not status.stdout.strip():
-        return True, "working tree already clean"
-    message = f"chore: initialize {project_name}" if created_repo else f"chore: initialize repository for {project_name}"
-    commit = git(path, "commit", "-m", message)
-    if commit.returncode:
-        return False, commit.stderr.strip() or commit.stdout.strip() or "git commit failed"
-    return True, message
+def normalize_remote(url):
+    value = (url or "").strip().removesuffix("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    return value.lower()
+
+
+def expected_remote(owner, repo):
+    return f"https://github.com/{owner}/{repo}.git"
+
+
+def remote_status(owner, repo, path, token):
+    current = get_remote(path)
+    if not current:
+        return "missing", ""
+    target = expected_remote(owner, repo)
+    if normalize_remote(current) == normalize_remote(target):
+        return "valid", current
+    if token:
+        existing, detail = github_repo_exists_from_remote(current, token)
+        if existing:
+            return "valid-mapped", current
+        if detail == "not found":
+            return "broken", current
+        return "unknown", f"{current} ({detail})"
+    return "mismatch", current
+
+
+def github_repo_exists_from_remote(url, token):
+    match = re.search(r"github\.com[/:]([^/]+)/([^/#]+)", url or "", re.IGNORECASE)
+    if not match:
+        return False, "non-GitHub remote"
+    owner, repo = match.group(1), match.group(2).removesuffix(".git")
+    return github_repo_exists(owner, repo, token)
+
+
+def ensure_remote_for_project(name, info, path, apply):
+    owner = GITHUB_OWNER
+    repo = repo_slug(name, info)
+    target = expected_remote(owner, repo)
+    current = get_remote(path)
+    if current:
+        status, detail = remote_status(owner, repo, path, GITHUB_TOKEN)
+        if status in {"valid", "valid-mapped"}:
+            return True, f"preserved existing remote {detail}"
+        if status == "broken":
+            print(f"[BROKEN] {name}: remote does not exist on GitHub: {current}")
+            if not apply:
+                return False, "broken remote requires repair"
+            if not GITHUB_TOKEN:
+                return False, "GITHUB_TOKEN is missing for remote repair"
+            if not info.get("auto_repair_remote", False):
+                return False, "auto repair disabled; mark auto_repair_remote=true explicitly"
+            result = git(path, "remote", "set-url", "origin", target)
+            return (True, f"repaired remote to {target}") if result.returncode == 0 else (False, result.stderr.strip() or "remote repair failed")
+        if status == "mismatch":
+            return False, f"remote differs; preserved: {current}"
+        return False, f"remote could not be verified; preserved: {detail}"
+
+    if not GITHUB_TOKEN:
+        return False, "no origin and GITHUB_TOKEN is missing"
+    exists, detail = github_repo_exists(owner, repo, GITHUB_TOKEN)
+    if not exists and detail not in {"not found"}:
+        return False, detail
+    if not exists and apply:
+        ok, created = github_create_repo(owner, repo, GITHUB_TOKEN, GITHUB_VISIBILITY != "public")
+        if not ok:
+            return False, created
+        target = created
+    elif not exists:
+        return False, f"repo {owner}/{repo} missing; would create"
+    if not apply:
+        return False, f"no origin; would link {target}"
+    result = git(path, "remote", "add", "origin", target)
+    return (True, f"linked origin {target}") if result.returncode == 0 else (False, result.stderr.strip() or "could not add origin")
+
+
+def ensure_readme(path, name, info, apply):
+    target = Path(path) / "README.md"
+    if target.exists():
+        return "existing README preserved"
+    if not apply:
+        return "README missing; would create basic README"
+    title = name.replace("_", " ").replace("-", " ").title()
+    text = f"# {title}\n\nProject status: **{info.get('status', 'in-progress')}**.\n\nManaged by ProjectHub.\n"
+    target.write_text(text, encoding="utf-8")
+    return "created basic README.md"
+
+
+def ollama_commit_message(name):
+    model = ENV.get("OLLAMA_MODEL") or os.getenv("OLLAMA_MODEL", "")
+    url = ENV.get("OLLAMA_URL") or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+    fallback = f"chore: update {name}"
+    if not model:
+        return fallback
+    try:
+        req = urllib.request.Request(url, data=json.dumps({"model": model, "prompt": f"Write one concise Conventional Commit message for changes in project {name}. Return only the message.", "stream": False}).encode(), method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            text = json.loads(response.read().decode()).get("response", "").strip().splitlines()[0]
+        return text[:200] or fallback
+    except Exception:
+        return fallback
 
 
 def auto_project(name, info, cache):
     path = info.get("path", "")
     if not os.path.isdir(path):
         return "skipped", "path missing"
-    current, previous = scan_signature(path), cache.get(name)
+    current = scan_signature(path)
+    previous = cache.get(name)
     if previous is None:
         cache[name] = current
         return "baseline", "baseline created"
     if current.get("hash") == previous.get("hash"):
         return "skipped", "no detected changes"
 
-    branch = str(info.get("branch") or "main")
-    ok, initialized, detail = ensure_git_repo(path, branch)
+    branch_name = str(info.get("branch") or "main")
+    ok, initialized, git_detail = ensure_git_repo(path, branch_name)
     if not ok:
-        return "error", detail
+        return "error", git_detail
 
-    ok, remote_detail = ensure_remote(name, path)
-    if not ok:
+    remote_ok, remote_detail = ensure_remote_for_project(name, info, path, apply=True)
+    if not remote_ok:
         return "skipped", remote_detail
 
+    readme_detail = ensure_readme(path, name, info, apply=True)
     add = git(path, "add", ".")
     if add.returncode:
         return "error", add.stderr.strip() or "git add failed"
 
-    ok, commit_detail = ensure_initial_commit(path, name, initialized)
-    if not ok:
-        return "error", commit_detail
+    status = git(path, "status", "--porcelain")
+    if status.returncode:
+        return "error", status.stderr.strip() or "git status failed"
+    if not status.stdout.strip():
+        cache[name] = current
+        return "skipped", "no commit-worthy changes"
 
-    active = git(path, "branch", "--show-current").stdout.strip() or branch
+    message = ollama_commit_message(name)
+    commit = git(path, "commit", "-m", message)
+    if commit.returncode:
+        return "error", commit.stderr.strip() or commit.stdout.strip() or "git commit failed"
+
+    active = git(path, "branch", "--show-current").stdout.strip() or branch_name
     push = git(path, "push", "-u", "origin", active)
     if push.returncode:
-        return "error", push.stderr.strip() or "git push failed"
+        return "error", "push failed without force-overwriting remote: " + (push.stderr.strip() or "unknown git push error")
 
     cache[name] = current
-    return "updated", f"{detail}; {remote_detail}; {commit_detail}; pushed {active}"
+    return "updated", f"{git_detail}; {remote_detail}; {readme_detail}; committed '{message}'; pushed {active}"
 
 
 def run_auto(projects, only_names=None):
