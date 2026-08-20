@@ -1,67 +1,15 @@
 {
-  "emobuddy_weekly_monthly": {
-    "path": "D:/projects/emobuddy_weekly_monthly",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "medical-agency-platform": {
-    "path": "D:/projects/medical-agency-platform",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "my-webapp": {
-    "path": "D:/projects/my-webapp",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "PromptBridge": {
-    "path": "D:/projects/PromptBridge",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "RuhumAI_main": {
-    "path": "C:/Users/shahu/OneDrive/RuhumAI",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "RuhumAI_experimental": {
-    "path": "C:/Users/shahu/OneDrive/RuhumAI_Experimental",
-    "status": "experimental",
-    "branch": "main"
-  },
-  "nashramobile": {
-    "path": "D:/nashramobile",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "aylin-android-updated": {
-    "path": "D:/aylin-android-updated",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "codequest": {
-    "path": "D:/codequest",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "family_link": {
-    "path": "D:/Projects/New folder/family_link",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "Aylin_project": {
-    "path": "D:/Projects/Miss Aylin Rahman/Aylin",
-    "status": "in-progress",
-    "branch": "main"
-  },
-  "TalkEasy": {
-    "path": "D:/Users/Taha/TalkEasy",
-    "status": "flagship",
-    "branch": "main"
-  },
-  "TalkEasy_AI": {
-    "path": "D:/Users/Taha/TalkEasy-AI",
-    "status": "flagship",
-    "branch": "main"
-  }
+  "emobuddy_weekly_monthly": {"path":"D:/projects/emobuddy_weekly_monthly","status":"in-progress","branch":"main"},
+  "medical-agency-platform": {"path":"D:/projects/medical-agency-platform","status":"in-progress","branch":"main"},
+  "my-webapp": {"path":"D:/projects/my-webapp","status":"in-progress","branch":"main"},
+  "PromptBridge": {"path":"D:/projects/PromptBridge","status":"in-progress","branch":"main"},
+  "RuhumAI_main": {"path":"C:/Users/shahu/OneDrive/RuhumAI","status":"in-progress","branch":"main","github_repo":"ruhum_ai"},
+  "RuhumAI_experimental": {"path":"C:/Users/shahu/OneDrive/RuhumAI_Experimental","status":"experimental","branch":"main"},
+  "nashramobile": {"path":"D:/nashramobile","status":"in-progress","branch":"main","github_repo":"NashraMobile"},
+  "aylin-android-updated": {"path":"D:/aylin-android-updated","status":"in-progress","branch":"main"},
+  "codequest": {"path":"D:/codequest","status":"in-progress","branch":"main"},
+  "family_link": {"path":"D:/Projects/New folder/family_link","status":"in-progress","branch":"main"},
+  "Aylin_project": {"path":"D:/Projects/Miss Aylin Rahman/Aylin","status":"in-progress","branch":"main"},
+  "TalkEasy": {"path":"D:/Users/Taha/TalkEasy","status":"flagship","branch":"main"},
+  "TalkEasy_AI": {"path":"D:/Users/Taha/TalkEasy-AI","status":"flagship","branch":"main","github_repo":"TalkEasy-AI"}
 }
