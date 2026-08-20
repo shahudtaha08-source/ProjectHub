@@ -227,7 +227,6 @@ def github_api_create_repo(name: str):
         return True, data["clone_url"]
     except urllib.error.HTTPError as exc:
         if exc.code == 422:
-            # Repository may already exist; link the predictable owner/repo URL.
             return True, f"https://github.com/{GITHUB_OWNER}/{name}.git"
         try:
             detail = exc.read().decode("utf-8", "ignore")
@@ -259,7 +258,10 @@ def auto_project(name: str, info: dict, cache: dict):
     if not os.path.isdir(path):
         return "skipped", "path missing"
     current = scan_signature(path)
-    previous = cache.get(name, {})
+    previous = cache.get(name)
+    if previous is None:
+        cache[name] = current
+        return "baseline", "baseline created"
     if current.get("hash") == previous.get("hash"):
         return "skipped", "no detected changes"
 
@@ -297,7 +299,7 @@ def auto_project(name: str, info: dict, cache: dict):
 
 def run_auto(projects: dict, only_names=None) -> None:
     cache = load_cache()
-    summary = {"updated": 0, "skipped": 0, "errors": 0}
+    summary = {"updated": 0, "skipped": 0, "errors": 0, "baselined": 0}
     allowed = set(only_names) if only_names else None
     for name, info in projects.items():
         if allowed is not None and name not in allowed:
@@ -306,6 +308,9 @@ def run_auto(projects: dict, only_names=None) -> None:
         if status == "updated":
             print(f"[UPDATED] {name} ({detail})")
             summary["updated"] += 1
+        elif status == "baseline":
+            print(f"[BASELINE] {name}")
+            summary["baselined"] += 1
         elif status == "error":
             print(f"[ERROR] {name}: {detail}")
             summary["errors"] += 1
@@ -314,9 +319,10 @@ def run_auto(projects: dict, only_names=None) -> None:
             summary["skipped"] += 1
     save_cache(cache)
     print("\n===== Auto Mode Summary =====")
-    print(f"[UPDATED] {summary['updated']}")
-    print(f"[SKIPPED] {summary['skipped']}")
-    print(f"[ERROR] {summary['errors']}")
+    print(f"[UPDATED]   {summary['updated']}")
+    print(f"[BASELINE]  {summary['baselined']}")
+    print(f"[SKIPPED]   {summary['skipped']}")
+    print(f"[ERROR]     {summary['errors']}")
 
 
 def watch_projects(projects: dict) -> None:
@@ -337,7 +343,7 @@ def watch_projects(projects: dict) -> None:
                 current = scan_signature(path) if os.path.isdir(path) else None
                 if current != observed.get(name):
                     observed[name] = current
-                    pending[name] = now  # reset debounce on every new change
+                    pending[name] = now
                     print(f"[DETECTED] {name}")
 
             ready = [name for name, changed_at in pending.items() if now - changed_at >= WATCH_DEBOUNCE]
