@@ -1,4 +1,4 @@
-"""ProjectHub - project registry, change detection and safe GitHub automation."""
+"""ProjectHub - project registry, change detection and safe Git/GitHub automation."""
 import argparse
 import difflib
 import hashlib
@@ -92,8 +92,7 @@ def rename_score(project_name, folder_name):
 def find_renamed_folder(name, old_path):
     old = Path(old_path)
     roots = [old.parent, *SEARCH_ROOTS]
-    seen = set()
-    candidates = []
+    seen, candidates = set(), []
     for root in roots:
         try:
             root = root.resolve()
@@ -254,11 +253,7 @@ def repo_slug(name, info):
 
 def github_api_request(method, url, token, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "ProjectHub",
-        "Content-Type": "application/json",
-    }
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "ProjectHub", "Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -285,11 +280,7 @@ def github_repo_exists(owner, repo, token):
 def github_create_repo(owner, repo, token, private=True):
     if not token:
         return False, "GITHUB_TOKEN is missing"
-    code, data = github_api_request("POST", "https://api.github.com/user/repos", token, {
-        "name": repo,
-        "private": private,
-        "auto_init": False,
-    })
+    code, data = github_api_request("POST", "https://api.github.com/user/repos", token, {"name": repo, "private": private, "auto_init": False})
     if code in (200, 201):
         return True, data.get("clone_url", f"https://github.com/{owner}/{repo}.git")
     if code == 422:
@@ -326,38 +317,32 @@ def remote_status(owner, repo, path, token):
     target = expected_remote(owner, repo)
     if normalize_remote(current) == normalize_remote(target):
         return "valid", current
-    if token:
-        existing, detail = github_repo_exists_from_remote(current, token)
-        if existing:
-            return "valid-mapped", current
-        if detail == "not found":
-            return "broken", current
-        return "unknown", f"{current} ({detail})"
-    return "mismatch", current
+    if not token:
+        # Preserve an existing origin when offline/unconfigured. A later push is the real test.
+        return "preserved-unverified", current
+    existing, detail = github_repo_exists_from_remote(current, token)
+    if existing:
+        return "valid-mapped", current
+    if detail == "not found":
+        return "broken", current
+    return "unknown", f"{current} ({detail})"
 
 
-def ensure_remote_for_project(name, info, path, apply=True):
-    owner = GITHUB_OWNER
-    repo = repo_slug(name, info)
-    target = expected_remote(owner, repo)
-    current = get_remote(path)
-
+def ensure_remote_for_project(name, info, path):
+    owner, repo = GITHUB_OWNER, repo_slug(name, info)
+    target, current = expected_remote(owner, repo), get_remote(path)
     if current:
         status, detail = remote_status(owner, repo, path, GITHUB_TOKEN)
-        if status in {"valid", "valid-mapped"}:
+        if status in {"valid", "valid-mapped", "preserved-unverified"}:
             return True, f"preserved existing remote {detail}"
         if status == "broken":
             print(f"[BROKEN] {name}: remote does not exist on GitHub: {current}")
             return False, "broken remote requires explicit repair"
-        if status == "mismatch":
-            return False, f"remote differs; preserved: {current}"
         return False, f"remote could not be verified; preserved: {detail}"
-
     if not GITHUB_TOKEN:
         return False, "no origin and GITHUB_TOKEN is missing"
-
     exists, detail = github_repo_exists(owner, repo, GITHUB_TOKEN)
-    if not exists and detail not in {"not found"}:
+    if not exists and detail != "not found":
         return False, detail
     if not exists:
         if not AUTO_CREATE_REPOS:
@@ -366,7 +351,6 @@ def ensure_remote_for_project(name, info, path, apply=True):
         if not ok:
             return False, created
         target = created
-
     result = git(path, "remote", "add", "origin", target)
     return (True, f"linked origin {target}") if result.returncode == 0 else (False, result.stderr.strip() or "could not add origin")
 
@@ -374,18 +358,14 @@ def ensure_remote_for_project(name, info, path, apply=True):
 def ensure_readme(path, name, info):
     target = Path(path) / "README.md"
     if target.exists():
-        return "existing README preserved"
+        return False, "existing README preserved"
     title = name.replace("_", " ").replace("-", " ").title()
-    text = (
-        f"# {title}\n\n"
-        f"Project status: **{info.get('status', 'in-progress')}**.\n\n"
-        "Managed by ProjectHub.\n"
-    )
+    text = f"# {title}\n\nProject status: **{info.get('status', 'in-progress')}**.\n\nManaged by ProjectHub.\n"
     try:
         target.write_text(text, encoding="utf-8")
-        return "created basic README.md"
+        return True, "created basic README.md"
     except OSError as exc:
-        return f"README creation failed: {exc}"
+        return False, f"README creation failed: {exc}"
 
 
 def ollama_commit_message(name):
@@ -396,12 +376,7 @@ def ollama_commit_message(name):
         return fallback
     try:
         prompt = f"Write one concise Conventional Commit message for changes in project {name}. Return only the message."
-        req = urllib.request.Request(
-            url,
-            data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
+        req = urllib.request.Request(url, data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(), method="POST", headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=20) as response:
             text = json.loads(response.read().decode()).get("response", "").strip().splitlines()[0]
         return text[:200] or fallback
@@ -409,71 +384,111 @@ def ollama_commit_message(name):
         return fallback
 
 
+def commit_if_needed(path, name):
+    add = git(path, "add", ".")
+    if add.returncode:
+        return False, False, add.stderr.strip() or "git add failed"
+    status = git(path, "status", "--porcelain")
+    if status.returncode:
+        return False, False, status.stderr.strip() or "git status failed"
+    if not status.stdout.strip():
+        return True, False, "no commit-worthy changes"
+    message = ollama_commit_message(name)
+    commit = git(path, "commit", "-m", message)
+    if commit.returncode:
+        return False, False, commit.stderr.strip() or commit.stdout.strip() or "git commit failed"
+    return True, True, f"committed '{message}'"
+
+
+def branch_name(path, fallback):
+    result = git(path, "branch", "--show-current")
+    return result.stdout.strip() or fallback or "main"
+
+
+def ahead_of_remote(path, branch):
+    result = git(path, "rev-parse", "--verify", f"@{{u}}..{branch}")
+    if result.returncode:
+        return True
+    count = git(path, "rev-list", "--count", f"@{{u}}..{branch}")
+    return count.returncode == 0 and count.stdout.strip() not in {"", "0"}
+
+
+def safe_push(path, branch):
+    push = git(path, "push", "-u", "origin", branch)
+    if push.returncode == 0:
+        return True, f"pushed {branch}"
+    combined = (push.stderr + "\n" + push.stdout).lower()
+    if not any(token in combined for token in ("non-fast-forward", "fetch first", "rejected")):
+        return False, "push failed without force-overwriting remote: " + (push.stderr.strip() or push.stdout.strip() or "unknown git push error")
+    sync = git(path, "pull", "--rebase", "origin", branch)
+    if sync.returncode:
+        git(path, "rebase", "--abort")
+        return False, "push rejected; safe rebase could not be completed, remote was not overwritten: " + (sync.stderr.strip() or sync.stdout.strip() or "rebase failed")
+    retry = git(path, "push", "-u", "origin", branch)
+    if retry.returncode:
+        return False, "push still failed after safe rebase; remote was not overwritten: " + (retry.stderr.strip() or retry.stdout.strip() or "unknown git push error")
+    return True, f"rebased safely and pushed {branch}"
+
+
 def auto_project(name, info, cache):
     path = info.get("path", "")
     if not os.path.isdir(path):
         return "skipped", "path missing"
-
-    current = scan_signature(path)
     previous = cache.get(name)
-    if previous is None:
-        cache[name] = current
-        return "baseline", "baseline created"
-    if current.get("hash") == previous.get("hash"):
-        return "skipped", "no detected changes"
+    before = scan_signature(path)
+    branch = str(info.get("branch") or "main")
 
-    branch_name = str(info.get("branch") or "main")
-    ok, initialized, git_detail = ensure_git_repo(path, branch_name)
+    ok, initialized, git_detail = ensure_git_repo(path, branch)
     if not ok:
         return "error", git_detail
+    readme_created, readme_detail = ensure_readme(path, name, info)
+    after_setup = scan_signature(path)
+    changed = previous is None or after_setup.get("hash") != previous.get("hash")
 
-    remote_ok, remote_detail = ensure_remote_for_project(name, info, path, apply=True)
+    committed_detail = "no content changes"
+    if changed or initialized or readme_created:
+        committed_ok, committed, committed_detail = commit_if_needed(path, name)
+        if not committed_ok:
+            return "error", committed_detail
+    else:
+        committed = False
+
+    remote_ok, remote_detail = ensure_remote_for_project(name, info, path)
+    final_signature = scan_signature(path)
+    cache[name] = final_signature
+
     if not remote_ok:
-        return "skipped", remote_detail
+        if committed:
+            return "pending", f"{git_detail}; {readme_detail}; {committed_detail}; remote pending: {remote_detail}"
+        return "pending", f"{git_detail}; {readme_detail}; remote pending: {remote_detail}"
 
-    readme_detail = ensure_readme(path, name, info)
-    add = git(path, "add", ".")
-    if add.returncode:
-        return "error", add.stderr.strip() or "git add failed"
+    active = branch_name(path, branch)
+    if committed or ahead_of_remote(path, active):
+        pushed, push_detail = safe_push(path, active)
+        if not pushed:
+            return "error", f"{git_detail}; {readme_detail}; {committed_detail}; {push_detail}"
+        return "updated", f"{git_detail}; {readme_detail}; {remote_detail}; {committed_detail}; {push_detail}"
 
-    status = git(path, "status", "--porcelain")
-    if status.returncode:
-        return "error", status.stderr.strip() or "git status failed"
-    if not status.stdout.strip():
-        cache[name] = current
-        return "skipped", "no commit-worthy changes"
-
-    message = ollama_commit_message(name)
-    commit = git(path, "commit", "-m", message)
-    if commit.returncode:
-        return "error", commit.stderr.strip() or commit.stdout.strip() or "git commit failed"
-
-    active = git(path, "branch", "--show-current").stdout.strip() or branch_name
-    push = git(path, "push", "-u", "origin", active)
-    if push.returncode:
-        return "error", "push failed without force-overwriting remote: " + (push.stderr.strip() or "unknown git push error")
-
-    cache[name] = current
-    return "updated", f"{git_detail}; {remote_detail}; {readme_detail}; committed '{message}'; pushed {active}"
+    if previous is None:
+        return "baseline", f"baseline recorded; {git_detail}; {readme_detail}; {remote_detail}"
+    return "skipped", "no detected changes"
 
 
 def run_auto(projects, only_names=None):
     resolve_missing_paths(projects)
-    cache, summary = load_cache(), {"updated": 0, "skipped": 0, "errors": 0, "baselined": 0}
+    cache = load_cache()
+    summary = {"updated": 0, "pending": 0, "skipped": 0, "errors": 0, "baselined": 0}
     allowed = set(only_names) if only_names else None
     for name, info in projects.items():
         if allowed is not None and name not in allowed:
             continue
         status, detail = auto_project(name, info, cache)
-        label = {"updated": "UPDATED", "baseline": "BASELINE", "error": "ERROR", "skipped": "SKIPPED"}[status]
-        if status == "error":
-            print(f"[{label}] {name}: {detail}")
-        else:
-            print(f"[{label}] {name} ({detail})")
-        summary[{"updated": "updated", "baseline": "baselined", "error": "errors"}.get(status, "skipped")] += 1
+        label = {"updated": "UPDATED", "baseline": "BASELINE", "pending": "PENDING", "error": "ERROR", "skipped": "SKIPPED"}[status]
+        print(f"[{label}] {name}{': ' if status == 'error' else ' ('}{detail}{'' if status == 'error' else ')'}")
+        summary[{"updated": "updated", "baseline": "baselined", "pending": "pending", "error": "errors"}.get(status, "skipped")] += 1
     save_cache(cache)
     print("\n===== Auto Mode Summary =====")
-    for k in ("updated", "baselined", "skipped", "errors"):
+    for k in ("updated", "baselined", "pending", "skipped", "errors"):
         print(f"[{k.upper():<9}] {summary[k]}")
 
 
@@ -539,14 +554,12 @@ def main():
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--open", nargs="?")
     args = parser.parse_args()
-
     print(f"Loading index from: {INDEX_FILE}\n")
     projects = load_index()
     if not projects:
         return
     print("Validating project paths...")
     validate_paths(projects)
-
     if args.validate:
         display_projects(projects)
         return
